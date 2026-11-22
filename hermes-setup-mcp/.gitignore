@@ -1,0 +1,6 @@
+/.venv/
+/hosts.json
+/payloads/*
+!/payloads/README.txt
+__pycache__/
+.pytest_cache/

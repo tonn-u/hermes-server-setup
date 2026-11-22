@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "hermes-setup-mcp": {
+      "command": "C:/path/to/hermes-setup-mcp/.venv/Scripts/python.exe",
+      "args": [
+        "C:/path/to/hermes-setup-mcp/hermes-setup-mcp.py"
+      ]
+    }
+  }
+}

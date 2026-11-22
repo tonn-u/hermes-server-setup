@@ -1,0 +1,1952 @@
+# Hermes Agent setup for a dedicated Ubuntu Server.
+# Set the administrator and network values for your server before running tasks.
+[env]
+ADMIN_USER = "admin"
+HERMES_USER = "hermes"
+LAN_IF = "eth0"
+LAN_NET = "192.168.1.0/24"
+TAILSCALE_TAG = "tag:agent-server"
+WEB_PORT = "9120"
+
+[tasks.preflight]
+description = "Inspect OS, identity, storage and LAN"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: preflight: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+source /etc/os-release
+[[ "${ID:-}" == ubuntu && -d /run/systemd/system ]] || { echo 'Ubuntu with systemd is required' >&2; exit 1; }
+[[ "$HERMES_USER" == hermes && "$ADMIN_USER" != hermes && "$WEB_PORT" == 9120 ]] || { echo 'This runbook uses the dedicated hermes account and fixed Webapp port 9120' >&2; exit 1; }
+python3 -c 'import tomllib'
+cat /etc/os-release
+uname -m
+id
+sudo -v
+ip -br -4 addr
+ip -4 route
+free -h
+df -h /
+case "$(uname -m)" in aarch64|x86_64) ;; *) echo "Unsupported architecture" >&2; exit 1;; esac
+'''
+
+[tasks.packages]
+description = "Install OS dependencies and security updates"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: packages: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+read -r -p 'Install Hermes OS packages and enable unattended security updates? Type YES: ' answer
+[[ "$answer" == YES ]]
+sudo apt-get update
+sudo apt-get install -y curl git ca-certificates openssl libatomic1 build-essential python3 python3-venv python3-yaml nftables openssh-server unattended-upgrades nano htop tmux jq
+want=$(printf '%s\n' 'APT::Periodic::Update-Package-Lists "1";' 'APT::Periodic::Unattended-Upgrade "1";')
+if [[ $(sudo cat /etc/apt/apt.conf.d/99-mise-hermes-periodic 2>/dev/null || true) != "$want" ]]; then printf '%s\n' "$want" | sudo tee /etc/apt/apt.conf.d/99-mise-hermes-periodic >/dev/null; fi
+sudo systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+if [[ -e /run/reboot-required ]]; then echo 'Reboot required: run mise run reboot separately.'; fi
+'''
+
+[tasks.ssh-key]
+description = "Optional: append an OpenSSH Ed25519 public key"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: ssh-key: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+umask 077
+read -r -p 'Paste public key (ssh-ed25519 ...): ' key
+[[ "$key" == ssh-ed25519\ * ]]
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+printf '%s\n' "$key" > "$tmp"
+ssh-keygen -l -f "$tmp"
+[[ ! -L "$HOME/.ssh" && ! -L "$HOME/.ssh/authorized_keys" ]] || { echo 'Unexpected SSH directory/file symlink' >&2; exit 1; }
+install -d -m 700 "$HOME/.ssh"
+touch "$HOME/.ssh/authorized_keys"
+chmod 600 "$HOME/.ssh/authorized_keys"
+blob=$(awk '{print $2}' <<< "$key")
+awk -v blob="$blob" '{for(i=1;i<NF;i++) if($i=="ssh-ed25519" && $(i+1)==blob) found=1} END {exit !found}' "$HOME/.ssh/authorized_keys" || printf '\n%s\n' "$key" >> "$HOME/.ssh/authorized_keys"
+echo 'Test a NEW SSH session with the private key before ssh-harden.'
+'''
+
+[tasks.ssh-harden]
+description = "Require public-key SSH; preserve existing session"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: ssh-harden: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+[[ -s "$HOME/.ssh/authorized_keys" ]] || { echo 'No authorized_keys'; exit 1; }
+sudo bash -s -- "$ADMIN_USER" "${SSH_CONNECTION:-}" <<'ROOT'
+set -Eeuo pipefail
+admin=$1; connection=$2
+systemctl is-active --quiet ssh.service || { echo 'Start and test ssh.service before hardening; inspect ssh.socket separately.' >&2; exit 1; }
+f=/etc/ssh/sshd_config.d/00-mise-hermes.conf
+[[ ! -L "$f" ]] || { echo 'FAIL: managed SSH config is a symlink' >&2; exit 1; }
+tmp=$(mktemp -d /etc/ssh/sshd_config.d/.mise-hermes.XXXXXX)
+trap 'rm -rf -- "$tmp"' EXIT
+cat > "$tmp/wanted" <<EOF
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+MaxAuthTries 3
+X11Forwarding no
+AllowAgentForwarding no
+EOF
+if [[ -f "$f" ]] && grep -Fxq "AllowUsers $admin" "$f"; then printf '%s\n' "AllowUsers $admin" >> "$tmp/wanted"; fi
+validate() {
+  local cfg rootcfg peer peerport localaddr port key line
+  /usr/sbin/sshd -t || return 1
+  if [[ -n "$connection" ]]; then
+    read -r peer peerport localaddr port <<< "$connection"
+    cfg=$(/usr/sbin/sshd -T -C "user=$admin,host=$peer,addr=$peer,laddr=$localaddr,lport=$port" | LC_ALL=C awk 'NF {$1=tolower($1); print}') || return 1
+    rootcfg=$(/usr/sbin/sshd -T -C "user=root,host=$peer,addr=$peer,laddr=$localaddr,lport=$port" | LC_ALL=C awk 'NF {$1=tolower($1); print}') || return 1
+  else
+    cfg=$(/usr/sbin/sshd -T | LC_ALL=C awk 'NF {$1=tolower($1); print}') || return 1
+    rootcfg=$cfg
+  fi
+  for line in 'permitrootlogin no' 'pubkeyauthentication yes' 'passwordauthentication no' 'kbdinteractiveauthentication no' 'authenticationmethods publickey' 'permitemptypasswords no' 'maxauthtries 3' 'x11forwarding no' 'allowagentforwarding no'; do
+    grep -Fxq "$line" <<< "$cfg" || { echo "Effective setting differs: $line" >&2; return 1; }
+  done
+  if grep -Fxq "AllowUsers $admin" "$tmp/wanted"; then grep -Fxq "allowusers $admin" <<< "$cfg" || return 1; fi
+  grep -Fxq 'permitrootlogin no' <<< "$rootcfg" || return 1
+}
+if [[ -f "$f" ]] && cmp -s "$tmp/wanted" "$f" && [[ $(stat -c '%u:%g:%a' "$f") == 0:0:644 ]]; then
+  validate || { echo 'FAIL: existing managed SSH file matches but effective configuration differs; inspect other directives.' >&2; exit 1; }
+  echo 'OK: SSH hardening already matches; no reload or config write.'; exit 0
+fi
+read -r -p 'Have you tested a second key-only SSH session? Type YES: ' answer </dev/tty
+[[ "$answer" == YES ]]
+had=0; applied=0
+if [[ -f "$f" ]]; then cp -p "$f" "$tmp/backup"; had=1; fi
+rollback() {
+  local rc=$?; trap - EXIT
+  if (( rc && applied )); then
+    if (( had )); then mv -f -- "$tmp/backup" "$f"; else rm -f -- "$f"; fi
+    /usr/sbin/sshd -t && systemctl reload ssh.service || { echo "FAIL: SSH rollback reload failed; use existing SSH/console; backup directory $tmp" >&2; exit "$rc"; }
+  fi
+  rm -rf -- "$tmp"; exit "$rc"
+}
+trap rollback EXIT
+chmod 644 "$tmp/wanted"
+chown root:root "$tmp/wanted"
+mv -f -- "$tmp/wanted" "$f"; applied=1
+validate
+systemctl reload ssh.service
+ROOT
+echo 'Open a new LAN SSH session before closing this one. Test password rejection.'
+'''
+
+[tasks.firewall-stage]
+description = "Stage LAN-only SSH with a five-minute rollback"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: firewall-stage, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_FIREWALL_ACTION=stage mise run _firewall
+'''
+
+[tasks.firewall-commit]
+description = "Persist rules from a fresh tested LAN SSH session"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: firewall-commit, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_FIREWALL_ACTION=commit mise run _firewall
+'''
+
+[tasks.firewall-rollback]
+description = "Withdraw the managed SSH restriction"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: firewall-rollback, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_FIREWALL_ACTION=rollback mise run _firewall
+'''
+
+[tasks.user]
+description = "Create unprivileged Hermes runtime and enable user systemd"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: user: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+# sudo-rs can return 0 even when the listed user has no privileges.
+# Require an explicit denial; unexpected output or auth failure is not success.
+assert_no_sudo() {
+  local account=$1 output rc=0 denied
+  sudo -v || return 1
+  output=$(LC_ALL=C sudo -n -l -U "$account" 2>&1) || rc=$?
+  denied="User $account is not allowed to run sudo on "
+  if [[ "$output" == "$denied"*"." && "$output" != *$'\n'* && ( "$rc" == 0 || "$rc" == 1 ) ]]; then
+    printf 'OK: %s has no sudo privileges (list exit=%s)\n' "$account" "$rc"
+    return 0
+  fi
+  printf 'FAIL: cannot confirm no sudo privileges for %s (exit=%s)\n%s\n' "$account" "$rc" "$output" >&2
+  return 1
+}
+assert_safe_groups() {
+  local group memberships
+  memberships=$(id -nG "$1") || return 1
+  for group in $memberships; do
+    case "$group" in sudo|admin|wheel|docker|lxd|incus|disk|adm|libvirt|shadow) echo "Unsafe group for $1: $group" >&2; return 1;; esac
+  done
+}
+[[ "$HERMES_USER" != "$ADMIN_USER" && "$HERMES_USER" != root ]]
+if ! id "$HERMES_USER" >/dev/null 2>&1; then sudo adduser --disabled-password --gecos "" "$HERMES_USER"; fi
+assert_safe_groups "$HERMES_USER"
+assert_no_sudo "$HERMES_USER"
+home=$(getent passwd "$HERMES_USER" | cut -d: -f6)
+[[ "$home" == /home/hermes ]] && sudo test -d "$home" && sudo test ! -L "$home" || { echo 'Expected a real /home/hermes' >&2; exit 1; }
+[[ $(sudo stat -c %U "$home") == hermes ]]
+if [[ $(sudo stat -c %a "$home") != 700 ]]; then sudo chmod 700 "$home"; fi
+sudo loginctl enable-linger "$HERMES_USER"
+uid=$(id -u "$HERMES_USER")
+sudo systemctl start "user@$uid.service"
+[[ $(loginctl show-user "$HERMES_USER" -p Linger --value) == yes ]]
+sudo test -S "/run/user/$uid/bus"
+id "$HERMES_USER"
+'''
+
+[tasks.hermes-install]
+description = "Install stable Hermes as unprivileged user"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: hermes-install: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+read -r -p 'Install Hermes if missing using the official installer? Type YES: ' answer
+[[ "$answer" == YES ]]
+cd / # target users cannot traverse the administrator home
+uid=$(id -u "$HERMES_USER")
+sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'set -euo pipefail; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME";
+if command -v hermes >/dev/null; then hermes --version; exit 0; fi
+tmp=$(mktemp); trap "rm -f \"$tmp\"" EXIT
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$tmp"
+bash "$tmp" --non-interactive
+hermes --version
+'
+'''
+
+[tasks.hermes-model]
+description = "Select LLM provider, test one-shot inference, report optional tool diagnostics"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: hermes-model: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd / # target users cannot traverse the administrator home
+[[ "${HERMES_SETUP_SELECT_MODEL:-0}" =~ ^[01]$ ]]
+uid=$(id -u "$HERMES_USER")
+sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'set -euo pipefail; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME"; if [[ "$1" == 1 ]]; then hermes model; fi; if ! hermes doctor; then echo "WARNING: doctor found issues; review its output. Testing inference separately." >&2; fi; answer=$(timeout 180 hermes chat -Q -q "Reply with exactly OK. Do not use tools." </dev/null); if ! grep -Eq "^[[:space:]]*OK[.!]?[[:space:]]*$" <<< "$answer"; then echo "LLM smoke test did not return OK:" >&2; printf "%s\n" "$answer" >&2; exit 1; fi; echo "OK: LLM one-shot inference"' _ "${HERMES_SETUP_SELECT_MODEL:-0}"
+'''
+
+[tasks.telegram]
+description = "Set a private Telegram bot token and one permitted user"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: telegram, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_MESSAGING_PLATFORM=telegram mise run _messaging
+'''
+
+[tasks.discord-setup]
+description = "Set a Discord bot token, one permitted user and thread behavior"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: discord-setup, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_MESSAGING_PLATFORM=discord mise run _messaging
+'''
+
+[tasks.discord-status]
+description = "Inspect Gateway state before an end-to-end Discord test"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: discord-status, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+cd /
+uid=$(id -u "$HERMES_USER")
+sudo -v
+hermes_user() {
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'cd "$HOME" || exit; export PATH="$HOME/.local/bin:$PATH"; exec "$@"' _ "$@"
+}
+
+hermes_user systemctl --user is-enabled hermes-gateway.service
+hermes_user systemctl --user is-active hermes-gateway.service
+echo 'Gateway active. Confirm Discord with the permitted user and test a thread reply.'
+'''
+
+[tasks.gateway]
+description = "Install/enable/start Hermes user gateway"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: gateway: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd / # target users cannot traverse the administrator home
+uid=$(id -u "$HERMES_USER")
+if [[ $(systemctl show hermes-gateway.service -p LoadState --value) != not-found ]]; then
+  echo 'A system-scope Hermes gateway unit already exists; reconcile scope before using the user unit.' >&2
+  exit 1
+fi
+restart=${HERMES_SETUP_RESTART_GATEWAY:-0}
+[[ "$restart" == 0 || "$restart" == 1 ]]
+sudo -v
+sudo -n -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -s -- "$restart" <<'GATEWAY'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"; cd "$HOME"
+if ! systemctl --user cat hermes-gateway.service >/dev/null 2>&1; then hermes gateway install --no-start-now --start-on-login; fi
+if ! systemctl --user is-enabled --quiet hermes-gateway.service; then systemctl --user enable hermes-gateway.service; fi
+if systemctl --user is-active --quiet hermes-gateway.service; then
+  started=$(LC_ALL=C systemctl --timestamp=us+utc --user show hermes-gateway.service -p ExecMainStartTimestamp --value)
+  started=$(date -d "$started" +%s.%N)
+  if [[ "$1" == 1 ]] || ! python3 -c 'import pathlib,sys; h=pathlib.Path.home()/".hermes"; sys.exit(any(p.exists() and p.stat().st_mtime>float(sys.argv[1]) for p in (h/"config.yaml",h/".env")))' "$started"; then
+    read -r -p 'Gateway config changed or restart requested. Finish active work and type YES: ' answer </dev/tty
+    [[ "$answer" == YES ]]
+    hermes gateway restart
+  else echo 'OK: gateway active, config predates process; no restart.'; fi
+else hermes gateway start; fi
+systemctl --user is-active hermes-gateway.service
+systemctl --user show hermes-gateway.service -p ActiveState -p SubState -p MainPID -p Result
+GATEWAY
+'''
+
+[tasks.tailscale-install]
+description = "Install and start Tailscale daemon"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: tailscale-install: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+if ! command -v tailscale >/dev/null; then
+  read -r -p 'Run the official Tailscale installer as needed? Type YES: ' answer
+  [[ "$answer" == YES ]]
+  tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+  curl -fsSL https://tailscale.com/install.sh -o "$tmp"
+  sh "$tmp"
+fi
+sudo systemctl enable --now tailscaled
+'''
+
+[tasks.tailscale-login]
+description = "Authorize this server in your tailnet"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: tailscale-login: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+state=$(sudo tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["BackendState"])')
+if [[ "$state" == Running ]]; then
+  echo 'Existing Tailscale login preserved.'
+else
+  read -r -p 'Connect this machine to the intended Tailscale account? Type YES: ' answer
+  [[ "$answer" == YES ]]
+  sudo tailscale up --ssh=false
+fi
+tailscale status
+tailscale ip -4
+'''
+
+[tasks.webapp]
+description = "Build, configure and verify private authenticated Webapp on loopback"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: webapp: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd / # target users cannot traverse the administrator home
+action=${HERMES_SETUP_WEBAPP_ACTION:-on}
+[[ "$action" == on || "$action" == off ]]
+sudo -v
+url=
+if [[ "$action" == on ]]; then
+url=$(sudo tailscale status --json | python3 -c 'import sys,json,re; s=json.load(sys.stdin); n=s["Self"]["DNSName"].rstrip("."); assert s["BackendState"]=="Running" and re.fullmatch(r"[a-zA-Z0-9.-]+\.ts\.net",n), "Tailscale not ready"; print("https://hermes-web."+n.split(".",1)[1])')
+echo "Webapp origin: $url"
+fi
+hermes_cmd() {
+  local uid
+  uid=$(id -u "$HERMES_USER") || return 1
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'set -euo pipefail; export PATH="$HOME/.local/bin:$PATH"; cd "$HOME"; exec "$@"' _ "$@"
+}
+webapp_ready() {
+  local status rc=0 listeners
+  status=$(hermes_cmd timeout 25 hermes webapp --status 2>&1) || rc=$?
+  printf '%s\n' "$status"
+  # Some CLI releases return success even when the Webapp is unavailable.
+  if (( rc != 0 )) || ! grep -Eq '^Serving at[[:space:]]' <<< "$status" || grep -Eq '^Unavailable:' <<< "$status"; then
+    echo "Webapp status not ready (exit=$rc)" >&2; return 1
+  fi
+  listeners=$(ss -H -lnt "sport = :$WEB_PORT") || return 1
+  if ! awk -v p="127.0.0.1:$WEB_PORT" '$4==p {ok=1} $4!=p {bad=1} END {exit !(ok&&!bad)}' <<< "$listeners"; then
+    echo 'Expected an exclusive IPv4 loopback listener:' >&2; printf '%s\n' "$listeners" >&2; return 1
+  fi
+  local probe
+  probe=$(curl --noproxy '*' --silent --show-error --connect-timeout 3 --max-time 8 --output /dev/null --write-out '%{http_code}\n%{redirect_url}' "http://127.0.0.1:$WEB_PORT/" -H "Host: ${url#https://}" -H "X-Forwarded-Proto: https") || return 1
+  python3 - "$probe" <<'PYLOGIN'
+import sys,urllib.parse
+lines=sys.argv[1].splitlines(); code=lines[0] if lines else ''
+url=urllib.parse.urlsplit(lines[1] if len(lines)>1 else '')
+if code not in ('301','302','303','307','308') or url.path!='/login':
+    raise SystemExit('FAIL: unauthenticated Webapp root did not redirect to /login (HTTP '+code+')')
+print('OK: unauthenticated Webapp root redirects to login')
+PYLOGIN
+  [[ $? == 0 ]] || return 1
+  probe=$(curl --noproxy '*' --silent --show-error --connect-timeout 3 --max-time 8 --output /dev/null --write-out '%{http_code}\n%{redirect_url}' "http://127.0.0.1:$WEB_PORT/api/auth/me" -H "Host: ${url#https://}" -H "X-Forwarded-Proto: https") || return 1
+  python3 - "$probe" <<'PYGATE'
+import sys,urllib.parse
+lines=sys.argv[1].splitlines(); code=lines[0] if lines else ''
+url=urllib.parse.urlsplit(lines[1] if len(lines)>1 else '')
+if code not in ('401','403') and not (code in ('301','302','303','307','308') and url.path=='/login'):
+    raise SystemExit('FAIL: unauthenticated identity API did not deny access (HTTP '+code+')')
+print('OK: unauthenticated identity API denied access; browser credential test still required')
+PYGATE
+}
+webapp_config_current() {
+  local started invocation
+  invocation=$(hermes_cmd systemctl --user show hermes-gateway.service -p InvocationID --value) || return 1
+  [[ "$invocation" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+  started=$(hermes_cmd env LC_ALL=C systemctl --timestamp=us+utc --user show hermes-gateway.service -p ExecMainStartTimestamp --value) || return 1
+  started=$(date -d "$started" +%s.%N) || return 1
+  hermes_cmd /usr/bin/python3 - "$url" "$WEB_PORT" "$started" "$invocation" <<'PYWEBSTATE'
+import hashlib,json,pathlib,re,sys,yaml
+home=pathlib.Path.home()/'.hermes'; config=home/'config.yaml'; env=home/'.env'
+try:
+    settings=yaml.safe_load(config.read_text()) or {}; w=settings.get('webapp') or {}
+    assert w.get('enabled') is True and w.get('host')=='127.0.0.1' and str(w.get('port'))==sys.argv[2] and w.get('public_url')==sys.argv[1]
+    lines=env.read_text().splitlines()
+    def get(k):
+        m=[x.group(1).strip().strip('"\'') for l in lines if (x:=re.match(r'^\s*(?:export\s+)?'+re.escape(k)+r'\s*=\s*(.*)$',l))]
+        assert len(m)<=1; return m[0] if m else ''
+    p='HERMES_DASHBOARD_BASIC_AUTH_'
+    assert get(p+'USERNAME') and (get(p+'PASSWORD') or get(p+'PASSWORD_HASH')) and get(p+'SECRET')
+    assert env.stat().st_mode & 0o077 == 0
+    # Conservative: config/credentials must predate this gateway start. Same-second writes are ambiguous.
+    fingerprint={'invocation':sys.argv[4],'config':hashlib.sha256(config.read_bytes()).hexdigest(),'env':hashlib.sha256(env.read_bytes()).hexdigest()}
+    marker=home/'.mise-webapp-applied-v42.json'
+    try: same=json.loads(marker.read_text())==fingerprint
+    except (OSError,ValueError): same=False
+    assert same or max(config.stat().st_mtime,env.stat().st_mtime)<float(sys.argv[3])
+except (OSError,ValueError,TypeError,AttributeError,AssertionError,yaml.YAMLError): sys.exit(1)
+PYWEBSTATE
+}
+rotate=${HERMES_SETUP_ROTATE_WEBAPP_PASSWORD:-0}
+if [[ "$action" == on ]]; then
+  help=$(hermes_cmd hermes webapp --help)
+  [[ "$help" == *--status* ]] || { echo 'Installed Hermes has no compatible Webapp CLI.' >&2; exit 1; }
+  [[ "$rotate" != 1 || "$help" == *--sign-out* ]] || { echo 'Installed Hermes lacks --sign-out; rotation refused.' >&2; exit 1; }
+fi
+[[ "$rotate" == 0 || ( "$rotate" == 1 && "$action" == on ) ]] || { echo 'Invalid rotation flag' >&2; exit 1; }
+if ! /usr/bin/python3 -c 'import yaml' 2>/dev/null; then echo 'Missing python3-yaml; install only with approval' >&2; exit 1; fi
+if [[ "$action" == off ]]; then
+  if hermes_cmd /usr/bin/python3 -c 'import pathlib,sys,yaml;p=pathlib.Path.home()/".hermes/config.yaml"; w=(yaml.safe_load(p.read_text()) or {}).get("webapp") or {}; sys.exit(w.get("enabled",False) is not False)' &&
+     [[ -z $(ss -H -lnt "sport = :$WEB_PORT") ]]; then
+    echo 'OK: Webapp already off and its listener absent.'
+    exit 0
+  fi
+elif [[ "$rotate" == 0 ]] && hermes_cmd systemctl --user is-active --quiet hermes-gateway.service && hermes_cmd systemctl --user is-enabled --quiet hermes-gateway.service && webapp_config_current && webapp_ready; then
+  echo 'OK: configured Webapp already healthy; no build, credential change or restart.'; exit 0
+fi
+# Build before changing credentials or restarting the service. The native CLI
+# installs its own lazy frontend dependencies; no separate npm build is needed.
+if [[ "$action" == on ]]; then
+echo 'Checking existing Webapp bundle'
+hermes_cmd bash -c 'test -f "$HOME/.hermes/hermes-agent/apps/desktop/dist-webapp/index.html" && test ! -e "$HOME/.hermes/hermes-agent/apps/desktop/dist-webapp/.hermes-stale"' || { echo 'Webapp bundle missing or stale; build separately after reviewing dependencies' >&2; exit 1; }
+fi
+hermes_cmd systemctl --user is-active --quiet hermes-gateway.service || { echo 'Start the user Gateway first.' >&2; exit 1; }
+[[ -t 1 && -r /dev/tty ]] || { echo 'Run Webapp changes from an interactive terminal.' >&2; exit 1; }
+read -r -p 'Applying this Webapp change restarts Gateway (Discord/Telegram too). Finish active work and type YES: ' answer </dev/tty
+[[ "$answer" == YES ]]
+# Snapshot only the files owned by Hermes that this task changes. No root copy of secrets.
+was_active=0; mutated=0
+if hermes_cmd systemctl --user is-active --quiet hermes-gateway.service; then was_active=1; fi
+saved=$(hermes_cmd bash -c 'umask 077; p=$(mktemp -d "$HOME/.hermes/.mise-webapp-rollback.XXXXXX"); for f in config.yaml .env; do test ! -L "$HOME/.hermes/$f" || { echo "Unexpected symlink $f" >&2; exit 1; }; if [[ -f "$HOME/.hermes/$f" ]]; then cp -p "$HOME/.hermes/$f" "$p/$f"; fi; done; printf "%s\n" "$p"')
+restore_webapp() {
+  local rc=$?; trap - EXIT
+  if (( rc && mutated )); then
+    if [[ "$rotate" == 1 ]]; then
+      # Never restore a deliberately revoked password. Stop the gateway until recovery succeeds.
+      hermes_cmd systemctl --user stop hermes-gateway.service || true
+      echo "FAIL: rotation/configuration incomplete; gateway stopped, retry rotation. Confidential recovery copy: $saved" >&2
+      exit "$rc"
+    fi
+    if hermes_cmd bash -c 'set -e; for f in config.yaml .env; do if [[ -f "$1/$f" ]]; then cp -p "$1/$f" "$HOME/.hermes/$f"; else rm -f "$HOME/.hermes/$f"; fi; done' _ "$saved"; then
+      if (( was_active )); then hermes_cmd hermes gateway restart || echo 'FAIL: prior gateway could not restart' >&2
+      else hermes_cmd systemctl --user stop hermes-gateway.service || true; fi
+    else echo 'FAIL: Webapp configuration restore failed; use confidential backup' >&2; fi
+    echo "Confidential recovery copy: $saved" >&2
+  else hermes_cmd rm -rf -- "$saved"; fi
+  exit "$rc"
+}
+trap restore_webapp EXIT
+mutated=1
+if [[ "$action" == off ]]; then
+  hermes_cmd hermes config set webapp.enabled false
+  hermes_cmd hermes gateway restart
+  for attempt in {1..12}; do
+    if hermes_cmd systemctl --user is-active --quiet hermes-gateway.service && [[ -z $(ss -H -lnt "sport = :$WEB_PORT") ]]; then
+      echo 'OK: Gateway active and Webapp listener absent.'
+      exit 0
+    fi
+    sleep 2
+  done
+  echo 'Webapp listener did not disappear or Gateway failed to recover.' >&2
+  exit 1
+fi
+# Add credentials only if absent; never print existing secrets.
+sudo -H -u "$HERMES_USER" python3 - "$rotate" <<'PYCODE'
+import os,pathlib,re,secrets,tempfile,sys
+os.umask(0o077)
+p=pathlib.Path.home()/'.hermes'/'.env'; p.parent.mkdir(mode=0o700,exist_ok=True)
+old=p.read_text() if p.exists() else ''
+lines=old.splitlines()
+def get(k):
+    matches=[m.group(1).strip().strip('"\'') for line in lines if (m:=re.match(r'^\s*(?:export\s+)?'+re.escape(k)+r'\s*=\s*(.*)$',line))]
+    if len(matches)>1: raise SystemExit('Duplicate '+k+'; resolve manually')
+    return matches[0] if matches else ''
+def put(k,v):
+    lines[:]=[line for line in lines if not re.match(r'^\s*(?:export\s+)?'+re.escape(k)+r'\s*=',line)]
+    lines.append(k+'='+v)
+u='HERMES_DASHBOARD_BASIC_AUTH_USERNAME'; pw='HERMES_DASHBOARD_BASIC_AUTH_PASSWORD'; ph='HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH'; sk='HERMES_DASHBOARD_BASIC_AUTH_SECRET'
+if not get(u): put(u,'hermes')
+new_password=None
+if sys.argv[1]=='1':
+    lines[:]=[line for line in lines if not re.match(r'^\s*(?:export\s+)?'+re.escape(ph)+r'\s*=',line)]
+    new_password=secrets.token_urlsafe(24); put(pw,new_password); put(sk,secrets.token_hex(32))
+elif not get(pw) and not get(ph):
+    new_password=secrets.token_urlsafe(24); put(pw,new_password)
+if not get(sk): put(sk,secrets.token_hex(32))
+new='\n'.join(lines)+'\n'
+if new!=old:
+    with tempfile.NamedTemporaryFile(mode='w',dir=p.parent,delete=False) as f:
+        f.write(new); tmp=f.name
+    os.replace(tmp,p)
+p.chmod(0o600)
+if new_password:
+    print('Generated Webapp password (save in password manager now):',new_password)
+else: print('Existing Webapp credentials preserved.')
+PYCODE
+hermes_cmd hermes config set webapp.host 127.0.0.1
+hermes_cmd hermes config set webapp.port "$WEB_PORT"
+hermes_cmd hermes config set webapp.public_url "$url"
+hermes_cmd hermes config set webapp.enabled true
+hermes_cmd hermes gateway restart
+# Check the real listener and frontend, not merely CLI exit status.
+for attempt in {1..12}; do
+  if webapp_ready; then
+    if [[ "$rotate" == 1 ]]; then hermes_cmd hermes webapp --sign-out; fi
+    invocation=$(hermes_cmd systemctl --user show hermes-gateway.service -p InvocationID --value)
+    if ! hermes_cmd /usr/bin/python3 - "$invocation" <<'PYWEBMARK'
+import hashlib,json,os,pathlib,sys,tempfile
+p=pathlib.Path.home()/'.hermes'; marker=p/'.mise-webapp-applied-v42.json'
+state={'invocation':sys.argv[1],'config':hashlib.sha256((p/'config.yaml').read_bytes()).hexdigest(),'env':hashlib.sha256((p/'.env').read_bytes()).hexdigest()}
+os.umask(0o077)
+with tempfile.NamedTemporaryFile(mode='w',dir=p,delete=False) as f:
+    json.dump(state,f); name=f.name
+os.replace(name,marker)
+PYWEBMARK
+    then echo 'WARN: Webapp is healthy but no-op marker could not be recorded.' >&2; fi
+    echo "OK: Webapp ready for Tailscale Serve ($url)"
+    exit 0
+  fi
+  sleep 5
+done
+hermes_cmd journalctl --user -u hermes-gateway.service -n 50 --no-pager || true
+echo 'ERROR: Webapp did not become ready; not publishing it.' >&2
+exit 1
+'''
+
+[tasks.kb-storage]
+description = "Create private Hermes-owned knowledge base; migrate old storage if present"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-storage: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+[[ "$HERMES_USER" == hermes ]] || { echo 'FAIL: v5 requires HERMES_USER=hermes' >&2; exit 1; }
+cd /
+# Reuse the isolated publisher account and its existing deploy key, if present.
+if ! id kb-backup >/dev/null 2>&1; then sudo useradd --system --user-group --create-home --home-dir /var/lib/kb-backup --shell /usr/sbin/nologin kb-backup; fi
+[[ $(getent passwd kb-backup | cut -d: -f6) == /var/lib/kb-backup && $(id -gn kb-backup) == kb-backup ]] || { echo 'FAIL: unexpected publisher identity' >&2; exit 1; }
+[[ -z $(getent group kb-backup | cut -d: -f4) && $(getent passwd | awk -F: -v g="$(id -g kb-backup)" '$4==g {print $1}') == kb-backup ]] || { echo 'FAIL: publisher group is shared with another account' >&2; exit 1; }
+for account in hermes kb-backup; do
+  groups=$(id -nG "$account")
+  for g in $groups; do case "$g" in sudo|admin|wheel|docker|lxd|incus|disk|adm|libvirt|shadow) echo "FAIL: unsafe group $g for $account" >&2; exit 1;; esac; done
+  sudo -v; rc=0; out=$(LC_ALL=C sudo -n -l -U "$account" 2>&1) || rc=$?
+  if [[ "$out" != "User $account is not allowed to run sudo on "*"." || "$out" == *$'\n'* || ( "$rc" != 0 && "$rc" != 1 ) ]]; then printf 'FAIL: cannot confirm no sudo for %s\n%s\n' "$account" "$out" >&2; exit 1; fi
+  echo "OK: $account has no sudo rights"
+done
+sudo test ! -L /var/lib/kb-backup
+if [[ $(sudo stat -c '%U:%G:%a' /var/lib/kb-backup) != kb-backup:kb-backup:700 ]]; then sudo chmod 700 /var/lib/kb-backup; fi
+[[ $(sudo stat -c '%U:%G:%a' /var/lib/kb-backup) == kb-backup:kb-backup:700 ]] || { echo 'FAIL: unexpected publisher home owner/group' >&2; exit 1; }
+sudo test ! -L /srv/knowledge
+if ! sudo test -e /srv/knowledge; then sudo install -d -o hermes -g "$(id -gn hermes)" -m 0700 /srv/knowledge; fi
+owner=$(sudo stat -c %U /srv/knowledge)
+if [[ "$owner" == kb-sync ]]; then
+  # The old writer must be stopped before transferring ownership. Never delete the old KB.
+  for service in hermes-kb-sync.service hermes-kb-acl-kb-sync.service hermes-kb-acl-hermes.service hermes-kb-acl-kb-sync.timer hermes-kb-acl-hermes.timer hermes-kb-backup.timer hermes-kb-backup.service hermes-kb-export.service; do
+    state=$(sudo systemctl show "$service" -p ActiveState --value)
+    [[ "$state" == inactive || "$state" == failed ]] || { echo "Stop legacy unit or wait for the current job: $service ($state)" >&2; exit 1; }
+  done
+  read -r -p 'Legacy KB: close all Hermes CLI/chat writes now. Transfer existing files to hermes (no deletion)? Type YES: ' answer
+  [[ "$answer" == YES ]]
+  uid=$(id -u hermes)
+  h() { sudo -H -u hermes env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" systemctl --user "$@"; }
+  was_active=0
+  if h is-active --quiet hermes-gateway.service; then was_active=1; h stop hermes-gateway.service; fi
+  restore_gateway() { local rc=$?; trap - EXIT; if (( was_active )); then h start hermes-gateway.service || { echo 'FAIL: gateway restart failed; run mise run gateway' >&2; rc=1; }; fi; exit "$rc"; }
+  trap restore_gateway EXIT
+  sudo python3 - <<'PYMIGRATE'
+import os,pwd,stat,errno
+root='/srv/knowledge'; u=pwd.getpwnam('hermes'); old=pwd.getpwnam('kb-sync').pw_uid
+device=os.stat(root,follow_symlinks=False).st_dev
+
+def check(s,path):
+    if s.st_dev!=device or s.st_uid not in (u.pw_uid,old) or not (stat.S_ISDIR(s.st_mode) or (stat.S_ISREG(s.st_mode) and s.st_nlink==1)):
+        raise RuntimeError('Refuse migration of unexpected owner/type/link: '+path)
+def entries():
+    def fail(e):raise e
+    for path,dirs,files,dfd in os.fwalk(root,topdown=False,follow_symlinks=False,onerror=fail):
+        for n in dirs+files:
+            s=os.stat(n,dir_fd=dfd,follow_symlinks=False); p=os.path.join(path,n); check(s,p)
+            fd=os.open(n,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(os.O_DIRECTORY if stat.S_ISDIR(s.st_mode) else 0),dir_fd=dfd)
+            try:
+                now=os.fstat(fd); check(now,p)
+                if (now.st_dev,now.st_ino)!=(s.st_dev,s.st_ino):raise RuntimeError('KB changed during migration: '+p)
+                yield fd,now,p
+            finally:os.close(fd)
+    fd=os.open(root,os.O_RDONLY|os.O_NOFOLLOW|os.O_DIRECTORY)
+    try:
+        s=os.fstat(fd);check(s,root);yield fd,s,root
+    finally:os.close(fd)
+# First pass is non-mutating. Second pass transfers only known old ownership, bottom-up; rerunnable if interrupted.
+for _ in entries():pass
+for fd,s,p in entries():
+    if s.st_uid!=u.pw_uid or s.st_gid!=u.pw_gid:os.fchown(fd,u.pw_uid,u.pw_gid)
+    for attr in ('system.posix_acl_access','system.posix_acl_default'):
+        try:os.removexattr(fd,attr)
+        except OSError as e:
+            if e.errno not in (errno.ENODATA,errno.ENOTSUP):raise
+    mode=0o700 if stat.S_ISDIR(s.st_mode) else 0o600
+    if stat.S_IMODE(os.fstat(fd).st_mode)!=mode:os.fchmod(fd,mode)
+print('OK: old KB transferred to hermes; bytes and file names unchanged')
+PYMIGRATE
+  if (( was_active )); then h start hermes-gateway.service; fi
+  trap - EXIT
+elif [[ "$owner" != hermes ]]; then echo "FAIL: unexpected KB owner $owner; not changing it" >&2; exit 1
+fi
+# Private root protects all descendants, irrespective of former per-file ACLs.
+sudo python3 - <<'PYROOT'
+import os,pwd,stat,errno
+p='/srv/knowledge'; fd=os.open(p,os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+    s=os.fstat(fd); assert s.st_uid==pwd.getpwnam('hermes').pw_uid
+    for a in ('system.posix_acl_access','system.posix_acl_default'):
+        try:os.removexattr(fd,a)
+        except OSError as e:
+            if e.errno not in (errno.ENODATA,errno.ENOTSUP):raise
+    if stat.S_IMODE(os.fstat(fd).st_mode)!=0o700:os.fchmod(fd,0o700)
+finally:os.close(fd)
+PYROOT
+sudo -H -u hermes python3 - <<'PYREADME'
+import os,stat
+p='/srv/knowledge/README.md'
+try:
+    fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'w') as f:f.write('# ADLC Knowledge Base\n\nMarkdown, relative links and Mermaid diagrams.\n')
+except FileExistsError:
+    s=os.lstat(p)
+    if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1:raise RuntimeError('README.md must be a standalone regular file')
+    with open(p,'rb') as f:f.read(1)
+print('OK: Hermes owns the private KB and can read README.md')
+PYREADME
+sudo test ! -L /var/lib/hermes-kb-export
+if ! sudo test -e /var/lib/hermes-kb-export; then sudo install -d -o hermes -g kb-backup -m 2750 /var/lib/hermes-kb-export; fi
+[[ $(sudo stat -c '%U:%G:%a' /var/lib/hermes-kb-export) == hermes:kb-backup:2750 ]] || { echo 'FAIL: unexpected export-directory ownership/mode; no changes made to it' >&2; exit 1; }
+sudo -u kb-backup python3 -c 'import os; assert not os.access("/srv/knowledge",os.R_OK|os.X_OK), "publisher can access live KB"; assert not os.access("/var/lib/hermes-kb-export",os.W_OK), "publisher can modify staging directory"; print("OK: publisher cannot read live KB or modify staging directory")'
+echo 'OK: /srv/knowledge ready; no synchronization software needed.'
+'''
+
+[tasks.kb-git-key]
+description = "Generate isolated GitHub repository deploy key"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-git-key: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]]
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd / # target users cannot traverse the administrator home
+sudo test ! -L /var/lib/kb-backup/.ssh
+sudo install -d -o kb-backup -g kb-backup -m 0700 /var/lib/kb-backup/.ssh
+sudo -H -u kb-backup bash -s <<'KEYSETUP'
+set -euo pipefail
+umask 077
+cd "$HOME/.ssh"
+for f in github_adlc github_adlc.pub known_hosts; do
+  [[ ! -L "$f" ]] || { echo "FAIL: unexpected symlink $f" >&2; exit 1; }
+done
+if [[ ! -f github_adlc ]]; then
+  [[ ! -e github_adlc.pub ]] || { echo 'FAIL: only public key exists; recover private key or explicitly replace deploy key' >&2; exit 1; }
+  ssh-keygen -t ed25519 -N '' -C 'agent-ubuntu-backup' -f github_adlc
+fi
+key=$(ssh-keygen -y -P '' -f github_adlc)
+[[ "$key" == ssh-ed25519\ * ]] || { echo 'FAIL: existing deploy key is not Ed25519' >&2; exit 1; }
+if [[ -f github_adlc.pub ]]; then
+  [[ $(awk 'NR==1 {print $1" "$2}' github_adlc.pub) == $(awk '{print $1" "$2}' <<< "$key") ]] || { echo 'FAIL: deploy public/private key mismatch' >&2; exit 1; }
+else
+  printf '%s agent-ubuntu-backup\n' "$(awk '{print $1" "$2}' <<< "$key")" > github_adlc.pub
+fi
+# GitHub's published Ed25519 host key; reject drift, never silently accept a new host.
+expected='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'
+if [[ -e known_hosts ]]; then
+  [[ $(cat known_hosts) == "$expected" ]] || { echo 'FAIL: GitHub pinned host key mismatch; verify official documentation' >&2; exit 1; }
+else printf '%s\n' "$expected" > known_hosts; fi
+for f in github_adlc known_hosts; do if [[ $(stat -c %a "$f") != 600 ]]; then chmod 600 "$f"; fi; done
+cat github_adlc.pub
+KEYSETUP
+echo 'Create or reuse PRIVATE GitHub repo; add public key under Settings > Deploy keys > Allow write access.'
+'''
+
+[tasks.kb-git-setup]
+description = "Install one-way private GitHub publication with five-minute timer"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-git-setup: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd /
+sudo test -f /var/lib/kb-backup/.ssh/github_adlc
+sudo test -f /var/lib/kb-backup/.ssh/known_hosts
+sudo test -d /var/lib/hermes-kb-export
+repo=/var/lib/kb-backup/repo.git
+G=(sudo -H -u kb-backup env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --git-dir="$repo")
+sshcmd='ssh -F /dev/null -i /var/lib/kb-backup/.ssh/github_adlc -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile=/var/lib/kb-backup/.ssh/known_hosts -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=15'
+old=''
+sudo test ! -L "$repo"
+if sudo test -f "$repo/HEAD"; then
+  old=$("${G[@]}" config --local --get-all remote.origin.url || true)
+  if [[ -n "$old" && ! "$old" =~ ^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]]; then echo 'FAIL: invalid or multiple existing remotes' >&2; exit 1; fi
+  if "${G[@]}" config --get-all remote.origin.pushurl >/dev/null 2>&1 || "${G[@]}" config --get-regexp '^url\.' >/dev/null 2>&1; then echo 'FAIL: alternate/rewrite Git URL, no changes' >&2; exit 1; fi
+elif sudo test -e "$repo"; then echo 'FAIL: unexpected partial repo directory; inspect it before setup' >&2; exit 1; fi
+tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
+cat > "$tmp/publish.py" <<'PYPUBLISH'
+#!/usr/bin/python3
+# v5.0: one-way publication, no work-tree filters or client synchronization.
+import fnmatch, os, pathlib, stat, subprocess, sys, tarfile, tempfile, shlex
+from datetime import datetime, timezone
+
+BLOCKED = {'secrets','credentials','rag-index','thumbs.db','desktop.ini','id_rsa','id_ed25519','id_dsa','id_ecdsa','authorized_keys','known_hosts'}
+PATTERNS = ('~syncthing~*','*.pem','*.key','*.p12','*.pfx','*.ppk','*.kdbx','*.jks','*.keystore','*.gpg','*.asc','*.token','*.secret','*.credentials')
+LIMIT = 50*1024*1024
+TOTAL = 512*1024*1024
+
+def excluded(name):
+    s=name.casefold()
+    return s.startswith('.') or s in BLOCKED or any(fnmatch.fnmatchcase(s,p) for p in PATTERNS)
+
+def safe_path(name):
+    p=pathlib.PurePosixPath(name)
+    if not name or p.is_absolute() or str(p)!=name or any(x in ('','..','.') or excluded(x) for x in p.parts) or '\\' in name or any(ord(c)<32 or ord(c)==127 for c in name):
+        raise ValueError('Unsafe or excluded path: '+repr(name))
+    name.encode('utf-8','strict')
+    return name
+
+def fingerprint(s):
+    return (s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+
+def scan(root):
+    def fail(e): raise e
+    for base,dirs,files,dfd in os.fwalk(root,topdown=True,onerror=fail,follow_symlinks=False):
+        dirs[:]=sorted(d for d in dirs if not excluded(d))
+        for name in dirs+sorted(n for n in files if not excluded(n)):
+            rel=safe_path(os.path.relpath(os.path.join(base,name),root))
+            s=os.stat(name,dir_fd=dfd,follow_symlinks=False)
+            if name in dirs:
+                if not stat.S_ISDIR(s.st_mode): raise ValueError('Not a real directory: '+rel)
+                continue
+            if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1: raise ValueError('Not a plain standalone file: '+rel)
+            if s.st_size>LIMIT: raise ValueError('File exceeds 50 MiB: '+rel)
+            yield rel,dfd,name,s
+
+def export(root, target):
+    if not stat.S_ISDIR(os.lstat(root).st_mode): raise ValueError('KB root must be a directory')
+    target=pathlib.Path(target); seen={}; size=0; fd,tmp=tempfile.mkstemp(prefix='.export-',dir=target.parent)
+    try:
+        with os.fdopen(fd,'wb') as out:
+            with tarfile.open(fileobj=out,mode='w',format=tarfile.PAX_FORMAT) as t:
+                for rel,dfd,name,s in scan(root):
+                    size+=s.st_size
+                    if size>TOTAL: raise ValueError('KB export exceeds 512 MiB')
+                    with os.fdopen(os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=dfd),'rb') as f:
+                        before=fingerprint(os.fstat(f.fileno()))
+                        if before!=fingerprint(s): raise ValueError('File changed before export: '+rel)
+                        info=tarfile.TarInfo(rel); info.size=s.st_size; info.mode=0o644
+                        t.addfile(info,f)
+                        if fingerprint(os.fstat(f.fileno()))!=before: raise ValueError('File changed while exporting: '+rel)
+                        seen[rel]=before
+            if seen!={rel:fingerprint(s) for rel,_,__,s in scan(root)}: raise ValueError('KB changed during export; retry')
+            if 'README.md' not in seen: raise ValueError('README.md absent; refusing an unintended empty publication')
+            out.flush(); os.fchmod(out.fileno(),0o640); os.fsync(out.fileno())
+        os.replace(tmp,target)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    print(f'OK: exported {len(seen)} files, {size} bytes')
+
+def git_env():
+    return {**{k:v for k,v in os.environ.items() if not k.startswith('GIT_')},'GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':'/dev/null','GIT_TERMINAL_PROMPT':'0','GIT_NO_REPLACE_OBJECTS':'1','LC_ALL':'C','GIT_AUTHOR_NAME':'ADLC Ubuntu Server','GIT_AUTHOR_EMAIL':'adlc-backup@users.noreply.github.com','GIT_COMMITTER_NAME':'ADLC Ubuntu Server','GIT_COMMITTER_EMAIL':'adlc-backup@users.noreply.github.com'}
+
+SSH='ssh -F /dev/null -i /var/lib/kb-backup/.ssh/github_adlc -o IdentityAgent=none -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o UserKnownHostsFile=/var/lib/kb-backup/.ssh/known_hosts -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=15'
+
+def git(repo,*args,data=None,env=None,check=True):
+    r=subprocess.run(['git','--no-replace-objects','--git-dir='+str(repo),'-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-c','core.sshCommand='+SSH,*args],input=data,stdout=subprocess.PIPE,env=env or git_env(),cwd='/',check=check)
+    return r.stdout
+
+def remote_url(repo):
+    import re
+    x=git(repo,'config','--local','--get-all','remote.origin.url').decode().strip()
+    if not re.fullmatch(r'git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git',x): raise ValueError('Invalid or multiple GitHub remote URLs')
+    if git(repo,'remote','get-url','--push','--all','origin').decode().strip()!=x or git(repo,'remote','get-url','--all','origin').decode().strip()!=x: raise ValueError('Rewritten or alternate remote URL')
+    for line in git(repo,'config','--null','--list').split(b'\0'):
+        k=line.split(b'\n',1)[0].lower()
+        if k.startswith((b'include.',b'includeif.',b'url.')) or k in (b'remote.origin.pushurl',b'remote.origin.receivepack',b'remote.origin.uploadpack'):
+            raise ValueError('Unexpected Git configuration: '+repr(k))
+    return x
+
+def head(repo):
+    r=subprocess.run(['git','--git-dir='+str(repo),'show-ref','--verify','--hash','refs/heads/main'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=git_env(),cwd='/')
+    if r.returncode==0: return r.stdout.decode().strip()
+    if r.returncode!=128 and r.returncode!=1: raise ValueError('Cannot read local branch main')
+    # Distinguish absent main from a damaged or unexpected existing branch history.
+    refs=git(repo,'for-each-ref','--format=%(refname)','refs/heads').decode().splitlines()
+    if refs: raise ValueError('Local main is missing but other branches exist')
+    return ''
+
+def audit_history(repo,rev):
+    if not rev:return
+    for commit in set(git(repo,'log','--format=%T',rev).decode().splitlines()):
+        for entry in git(repo,'ls-tree','-rz',commit).split(b'\0'):
+            if not entry: continue
+            meta,path=entry.split(b'\t',1)
+            safe_path(path.decode('utf-8','strict'))
+            if not meta.startswith((b'100644 blob ',b'100755 blob ')):raise ValueError('Existing commit contains non-regular file')
+
+def make_commit(repo, archive):
+    previous=head(repo); audit_history(repo,previous)
+    # New index from raw byte blobs. No git add, line-ending conversion, attributes, or LFS filters.
+    with tempfile.TemporaryDirectory(prefix='snapshot-') as tmp:
+        env={**git_env(),'GIT_INDEX_FILE':os.path.join(tmp,'index')}; rows=[]; seen=set(); total=0
+        git(repo,'read-tree','--empty',env=env)
+        archive_fd=os.open(archive,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(archive_fd,'rb') as src, tarfile.open(fileobj=src,mode='r:') as t:
+            if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):raise ValueError('Export is not a regular archive')
+            for m in t:
+                name=safe_path(m.name)
+                if not m.isfile() or name in seen or m.size>LIMIT or m.size<0: raise ValueError('Invalid archive member: '+name)
+                total+=m.size
+                if total>TOTAL:raise ValueError('Export exceeds 512 MiB')
+                seen.add(name)
+                with t.extractfile(m) as f: data=f.read()
+                if len(data)!=m.size:raise ValueError('Truncated archive file: '+name)
+                oid=git(repo,'hash-object','-w','--stdin',data=data,env=env).strip()
+                rows.append(b'100644 '+oid+b'\t'+name.encode()+b'\0')
+        if 'README.md' not in seen:raise ValueError('Missing README.md; no publication')
+        git(repo,'update-index','-z','--index-info',data=b''.join(rows),env=env)
+        tree=git(repo,'write-tree',env=env).decode().strip()
+        if previous and git(repo,'rev-parse',previous+'^{tree}').decode().strip()==tree:
+            print('OK: unchanged KB, no new commit');return previous
+        args=['commit-tree',tree]
+        if previous:args+=['-p',previous]
+        new=git(repo,*args,'-m','KB snapshot '+datetime.now(timezone.utc).isoformat(),env=env).decode().strip()
+        git(repo,'update-ref','refs/heads/main',new,previous or '0'*len(new))
+        print('OK: local snapshot '+new);return new
+
+def remote_head(repo,url):
+    out=git(repo,'ls-remote','--refs',url,'refs/heads/main').decode().strip()
+    if not out:return ''
+    fields=out.split()
+    if len(fields)!=2 or fields[1]!='refs/heads/main':raise ValueError('Unexpected remote main')
+    return fields[0]
+
+def publish(repo,archive):
+    url=remote_url(repo); previous=head(repo); remote=remote_head(repo,url)
+    if not remote and previous:
+        # A completed publication records this ref. Never recreate a branch deleted upstream.
+        marker=subprocess.run(['git','--git-dir='+str(repo),'show-ref','--verify','--quiet','refs/hermes-publish/last-remote'],env=git_env(),cwd='/')
+        if marker.returncode==0: raise ValueError('Published remote main has disappeared; inspect repository and recovery plan')
+        if marker.returncode!=1: raise ValueError('Cannot inspect last publication marker')
+    if remote:
+        if not previous:raise ValueError('Remote main exists but local main is absent; refusing to overwrite')
+        git(repo,'merge-base','--is-ancestor',remote,previous)
+    elif not previous and git(repo,'ls-remote','--refs',url).strip():raise ValueError('New remote is not empty')
+    new=make_commit(repo,archive)
+    git(repo,'-c','push.followTags=false','push','--no-follow-tags',url,'refs/heads/main:refs/heads/main')
+    if remote_head(repo,url)!=new:raise ValueError('Remote main does not equal local main after push')
+    git(repo,'update-ref','refs/hermes-publish/last-remote',new)
+    print('OK: GitHub main published '+new)
+
+def verify(repo):
+    url=remote_url(repo); local=head(repo)
+    if not local:raise ValueError('No local main')
+    audit_history(repo,local)
+    if remote_head(repo,url)!=local:raise ValueError('Local and remote main differ; run kb-backup-now, never force-push')
+    print('OK: local and remote main match '+local)
+
+if __name__=='__main__':
+    try:
+        mode=sys.argv[1]
+        if mode=='export' and len(sys.argv)==4:export(*sys.argv[2:])
+        elif mode=='publish' and len(sys.argv)==4:publish(*sys.argv[2:])
+        elif mode=='verify' and len(sys.argv)==3:verify(sys.argv[2])
+        else:raise ValueError('Invalid publication command')
+    except (OSError,ValueError,RuntimeError,UnicodeError,tarfile.TarError,subprocess.CalledProcessError) as e:raise SystemExit('FAIL: KB publication: '+str(e))
+PYPUBLISH
+cat > "$tmp/export.service" <<'UNIT'
+[Unit]
+Description=Export a private KB snapshot as Hermes
+[Service]
+Type=oneshot
+User=hermes
+Group=kb-backup
+UMask=0027
+ExecStart=/usr/local/libexec/hermes-kb-publish export /srv/knowledge /var/lib/hermes-kb-export/snapshot.tar
+TimeoutStartSec=3min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hermes-kb-export
+UNIT
+cat > "$tmp/publish.service" <<'UNIT'
+[Unit]
+Description=Publish ADLC KB snapshot to private GitHub repository
+After=network-online.target hermes-kb-export.service
+Wants=network-online.target
+Requires=hermes-kb-export.service
+[Service]
+Type=oneshot
+User=kb-backup
+Group=kb-backup
+UMask=0077
+ExecStart=/usr/local/libexec/hermes-kb-publish publish /var/lib/kb-backup/repo.git /var/lib/hermes-kb-export/snapshot.tar
+TimeoutStartSec=4min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+InaccessiblePaths=/srv/knowledge
+ReadWritePaths=/var/lib/kb-backup
+UNIT
+cat > "$tmp/timer" <<'UNIT'
+[Unit]
+Description=Publish ADLC KB every five minutes
+[Timer]
+OnCalendar=*-*-* *:00/5:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+script=/usr/local/libexec/hermes-kb-publish
+export_unit=/etc/systemd/system/hermes-kb-export.service
+service=/etc/systemd/system/hermes-kb-backup.service
+timer=/etc/systemd/system/hermes-kb-backup.timer
+for p in "$script" "$export_unit" "$service" "$timer"; do sudo test ! -L "$p" || { echo "FAIL: managed symlink $p" >&2; exit 1; }; done
+same() { sudo cmp -s "$1" "$2" && [[ $(sudo stat -c '%u:%g:%a' "$2") == "0:0:$3" ]]; }
+if [[ -n "$old" ]] && same "$tmp/publish.py" "$script" 755 && same "$tmp/export.service" "$export_unit" 644 && same "$tmp/publish.service" "$service" 644 && same "$tmp/timer" "$timer" 644 && sudo systemctl is-enabled --quiet hermes-kb-backup.timer && sudo systemctl is-active --quiet hermes-kb-backup.timer; then
+  echo 'OK: publication already configured; no config write, service stop, restart or push. Use kb-verify for remote verification.'; exit 0
+fi
+if [[ -n "$old" ]]; then
+  remote=$old; printf 'Existing GitHub remote: %s\n' "$remote"
+else
+  read -r -p 'Private EMPTY repository SSH URL (git@github.com:OWNER/REPO.git): ' remote
+fi
+[[ "$remote" =~ ^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\.git$ ]] || { echo 'FAIL: invalid remote URL' >&2; exit 1; }
+read -r -p 'Confirmed correct PRIVATE repository and KB contains no secrets? Type YES: ' answer
+[[ "$answer" == YES ]]
+refs=$(sudo -H -u kb-backup env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_SSH_COMMAND="$sshcmd" git ls-remote --refs "$remote")
+if [[ -z "$old" && -n "$refs" ]]; then echo 'FAIL: new remote is not empty; use a new private empty repo' >&2; exit 1; fi
+python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp/publish.py"
+# Stop outdated or changed publication before changing configuration. On failure leave timer OFF,
+# never resume the older unsafe publisher. Retain local repo, deploy key and existing history for retry.
+if sudo systemctl is-active --quiet hermes-kb-backup.timer; then sudo systemctl stop hermes-kb-backup.timer; fi
+if sudo systemctl is-enabled --quiet hermes-kb-backup.timer; then sudo systemctl disable hermes-kb-backup.timer; fi
+for u in hermes-kb-backup.service hermes-kb-export.service; do
+  state=$(sudo systemctl show "$u" -p ActiveState --value)
+  if [[ "$state" != inactive && "$state" != failed ]]; then echo "FAIL: $u still running; timer stopped, retry once service finishes" >&2; exit 1; fi
+done
+if ! sudo test -f "$repo/HEAD"; then sudo -H -u kb-backup git init --bare -b main "$repo"; fi
+bound=$("${G[@]}" config --local --get-all remote.origin.url || true)
+[[ -z "$bound" || "$bound" == "$remote" ]] || { echo 'FAIL: remote changed, refusing' >&2; exit 1; }
+if [[ -z "$bound" ]]; then "${G[@]}" config --local remote.origin.url "$remote"; fi
+sudo install -d -m 755 /usr/local/libexec
+install_changed() {
+  local from=$1 to=$2 mode=$3 stage
+  if same "$from" "$to" "$mode"; then return 0; fi
+  stage=$(sudo mktemp "$to.new.XXXXXX")
+  sudo install -o root -g root -m "$mode" "$from" "$stage" && sudo mv -f -- "$stage" "$to" || { sudo rm -f -- "$stage"; return 1; }
+}
+install_changed "$tmp/publish.py" "$script" 755
+install_changed "$tmp/export.service" "$export_unit" 644
+install_changed "$tmp/publish.service" "$service" 644
+install_changed "$tmp/timer" "$timer" 644
+sudo systemd-analyze verify "$export_unit" "$service" "$timer"
+sudo systemctl daemon-reload
+# A failed start leaves the timer disabled. Re-running this same setup retries the first push.
+if ! sudo systemctl start hermes-kb-backup.service; then sudo journalctl -u hermes-kb-export.service -u hermes-kb-backup.service -n 35 --no-pager; echo 'FAIL: publication timer remains disabled; local history retained. Fix specific error and repeat kb-git-setup.' >&2; exit 1; fi
+sudo systemctl enable --now hermes-kb-backup.timer
+sudo systemctl list-timers hermes-kb-backup.timer
+'''
+
+[tasks.kb-backup-now]
+description = "Run GitHub snapshot on demand"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-backup-now: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]]
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+sudo systemctl start hermes-kb-backup.service
+sudo journalctl -u hermes-kb-backup.service -n 20 --no-pager
+'''
+
+[tasks.kb-verify]
+description = "Verify GitHub publication after setup, private KB and isolated key"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-verify: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+cd /
+[[ -z $(getent group kb-backup | cut -d: -f4) && $(getent passwd | awk -F: -v g="$(id -g kb-backup)" '$4==g {print $1}') == kb-backup ]] || { echo 'FAIL: publisher group shared' >&2; exit 1; }
+[[ $(sudo stat -c '%U:%a' /srv/knowledge) == hermes:700 ]] || { echo 'FAIL: live KB owner/mode' >&2; exit 1; }
+[[ $(sudo stat -c '%U:%G:%a' /var/lib/hermes-kb-export) == hermes:kb-backup:2750 ]] || { echo 'FAIL: snapshot directory permissions' >&2; exit 1; }
+sudo -u hermes python3 -c 'import os; p="/srv/knowledge"; assert os.access(p,os.R_OK|os.W_OK|os.X_OK); open(p+"/README.md","rb").read(1); print("OK: Hermes KB access")'
+sudo -u kb-backup python3 -c 'import os; assert not os.access("/srv/knowledge",os.X_OK); assert not os.access("/var/lib/hermes-kb-export",os.W_OK); print("OK: isolated publisher")'
+sudo -u hermes python3 -c 'import os; assert not os.access("/var/lib/kb-backup/.ssh/github_adlc",os.R_OK); print("OK: deploy key inaccessible to agent")'
+ports=$(sudo ss -H -lntup '( sport = :22000 or sport = :8384 or sport = :21027 )')
+[[ -z "$ports" ]] || { printf 'FAIL: legacy sync listener exists:\n%s\n' "$ports" >&2; exit 1; }
+for u in hermes-kb-sync.service hermes-kb-acl-kb-sync.timer hermes-kb-acl-hermes.timer hermes-kb-firewall.service; do
+  if sudo systemctl is-active --quiet "$u" || sudo systemctl is-enabled --quiet "$u" 2>/dev/null; then echo "FAIL: obsolete unit $u still active/enabled" >&2; exit 1; fi
+done
+sudo systemctl is-enabled --quiet hermes-kb-backup.timer
+sudo systemctl is-active --quiet hermes-kb-backup.timer
+[[ $(sudo systemctl show hermes-kb-backup.service -p User --value) == kb-backup ]]
+[[ $(sudo systemctl show hermes-kb-export.service -p User --value) == hermes ]]
+sudo systemctl show hermes-kb-backup.service -p ExecStart --value | grep -Fq '/usr/local/libexec/hermes-kb-publish publish'
+sudo systemctl show hermes-kb-export.service -p ExecStart --value | grep -Fq '/usr/local/libexec/hermes-kb-publish export'
+for u in hermes-kb-export.service hermes-kb-backup.service; do
+  [[ $(sudo systemctl show "$u" -p Result --value) == success ]] || { echo "FAIL: $u result not success; see journalctl" >&2; exit 1; }
+done
+sudo -H -u kb-backup /usr/local/libexec/hermes-kb-publish verify /var/lib/kb-backup/repo.git
+sudo systemctl list-timers hermes-kb-backup.timer
+echo 'OK: live KB isolated; latest local commit and remote main match. Check private visibility in GitHub UI.'
+'''
+
+[tasks.reboot]
+description = "Explicitly reboot Ubuntu Server"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: reboot: script line %s, exit %s (see preceding output)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, not root" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+if sudo systemctl is-active --quiet hermes-ssh-rollback.timer || sudo test -d /run/hermes-ssh-stage; then
+  echo 'Resolve staged SSH firewall before reboot' >&2
+  exit 1
+fi
+read -r -p 'Verified key access and ready to reboot? Type YES: ' answer
+[[ "$answer" == YES ]]
+sudo reboot
+'''
+
+[tasks.dashboard-install]
+description = "Prepare the authenticated loopback Dashboard and verify it"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: dashboard-install, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_DASHBOARD_ACTION=install mise run _dashboard
+'''
+
+[tasks.dashboard-status]
+description = "Verify Dashboard service, listener and sign-in gate"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: dashboard-status, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_DASHBOARD_ACTION=status mise run _dashboard
+'''
+
+[tasks.webapp-on]
+description = "Turn Webapp on using the verified gateway configuration"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: webapp-on, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_SETUP_WEBAPP_ACTION=on mise run webapp
+'''
+
+[tasks.webapp-off]
+description = "Turn Webapp off using the verified gateway configuration"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: webapp-off, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_SETUP_WEBAPP_ACTION=off mise run webapp
+'''
+
+[tasks.dashboard-on]
+description = "Turn Dashboard on independently of Gateway"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: dashboard-on, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_DASHBOARD_ACTION=on mise run _dashboard
+'''
+
+[tasks.dashboard-off]
+description = "Turn Dashboard off independently of Gateway"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: dashboard-off, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_DASHBOARD_ACTION=off mise run _dashboard
+'''
+
+[tasks.otel-install]
+description = "Install reviewed hermes_otel plugin without activating a running process"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: otel-install, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd /
+uid=$(id -u "$HERMES_USER")
+sudo -v
+hermes_user() {
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'cd "$HOME" || exit; export PATH="$HOME/.local/bin:$PATH"; exec "$@"' _ "$@"
+}
+
+if hermes_user hermes plugins list | awk '$1 == "hermes_otel" { found=1 } END { exit !found }'; then
+  hermes_user hermes plugins show hermes_otel
+  echo 'Already installed. Review its provenance and configuration before enabling it.'
+  exit 0
+fi
+read -r -p 'Install hermes_otel from the current Hermes catalog (with dependencies; disabled)? Type YES: ' answer
+[[ "$answer" == YES ]]
+hermes_user hermes plugins install hermes_otel --yes-deps --no-enable
+hermes_user hermes plugins show hermes_otel
+'''
+
+[tasks.otel-status]
+description = "Report plugin status and local store metadata without reading traces"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: otel-status, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+cd /
+uid=$(id -u "$HERMES_USER")
+sudo -v
+hermes_user() {
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'cd "$HOME" || exit; export PATH="$HOME/.local/bin:$PATH"; exec "$@"' _ "$@"
+}
+
+hermes_user hermes plugins show hermes_otel
+hermes_user bash -c '
+p="$HOME/.hermes/hermes_otel_live.db"
+if [[ -f "$p" ]]; then stat -c "OTel store permissions=%a owner=%U size=%s" "$p"
+else echo "OTel local store absent for this profile"; fi'
+'''
+
+[tasks.services-configure]
+description = "Publish both authenticated services privately in the tailnet"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: services-configure, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_SERVICES_ACTION=configure mise run _services
+'''
+
+[tasks.services-status]
+description = "Verify managed private routes and both local authentication gates"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: services-status, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_SERVICES_ACTION=status mise run _services
+'''
+
+[tasks.services-off]
+description = "Withdraw only the two matching private routes"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: services-off, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+HERMES_SERVICES_ACTION=off mise run _services
+'''
+
+[tasks.webapp-build]
+description = "Build Webapp assets as Hermes; may download dependencies"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: webapp-build, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+cd /
+uid=$(id -u "$HERMES_USER")
+sudo -v
+hermes_user() {
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'cd "$HOME" || exit; export PATH="$HOME/.local/bin:$PATH"; exec "$@"' _ "$@"
+}
+
+args=$(hermes_user hermes webapp --help)
+[[ "$args" == *--build-only* ]] || { echo 'This Hermes CLI lacks Webapp build support' >&2; exit 1; }
+read -r -p 'Build the Webapp using the current Hermes checkout and its dependencies? Type YES: ' answer
+[[ "$answer" == YES ]]
+hermes_user hermes webapp --build-only
+'''
+
+[tasks.validate]
+description = "Check TOML and Bash task syntax without executing provision commands"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: validate, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+python3 - <<'PYVALIDATE'
+import pathlib, subprocess, tomllib
+cfg=tomllib.loads(pathlib.Path('mise.toml').read_text(encoding='utf-8'))
+for name, task in cfg['tasks'].items():
+    script=task['run']
+    if any(chr(123)+c in script for c in '#%{'):
+        raise SystemExit(f'Unexpected mise template delimiter: {name}')
+    subprocess.run(['bash','-n'],input=script,text=True,check=True)
+    result=subprocess.run(['mise','run','--dry-run',name],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+    if result.returncode:
+        print(result.stdout)
+        raise SystemExit(f'Failed mise dry run: {name}')
+    print('OK:',name)
+print('TOML, Bash syntax and mise dry runs passed.')
+PYVALIDATE
+'''
+
+[tasks._firewall]
+description = "Internal SSH firewall implementation"
+hide = true
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: _firewall, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+action=${HERMES_FIREWALL_ACTION:?Missing firewall action}
+sudo -v
+sudo -n bash -s -- "$action" "$LAN_IF" "$LAN_NET" "${SSH_CONNECTION:-}" "${XDG_SESSION_ID:-}" <<'ROOT'
+set -Eeuo pipefail
+umask 077
+action=$1 iface=$2 network=$3 conn=$4 session=$5
+state=/run/hermes-ssh-stage
+service=hermes-ssh-firewall.service
+timer=hermes-ssh-rollback.timer
+rule=/etc/nftables.d/hermes-ssh.nft
+unit=/etc/systemd/system/$service
+exec 8>/run/hermes-ssh-firewall.lock
+flock -x 8
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+
+check_lan() {
+  python3 - "$iface" "$network" "$conn" <<'PYLAN'
+import ipaddress, json, re, subprocess, sys
+iface, network, conn=sys.argv[1:]
+if not re.fullmatch(r'[\w][\w.-]{0,14}',iface) or not conn:
+    sys.exit('A direct IPv4 LAN SSH session and a valid LAN_IF are required')
+lan=ipaddress.IPv4Network(network)
+if lan.prefixlen < 16 or not any(lan.subnet_of(ipaddress.IPv4Network(n)) for n in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')):
+    sys.exit('LAN_NET must be the actual RFC 1918 LAN prefix (/16 or narrower)')
+peer, _, local, port=conn.split()
+interfaces=json.loads(subprocess.check_output(['ip','-j','-4','addr','show','dev',iface]))
+route=json.loads(subprocess.check_output(['ip','-j','-4','route','get',peer,'from',local]))
+if port!='22' or ipaddress.IPv4Address(peer) not in lan or not any(r.get('dev')==iface and not r.get('gateway') for r in route):
+    sys.exit('The current SSH connection must use TCP 22 on the configured direct LAN')
+if not any(x.get('local')==local and ipaddress.IPv4Interface(f'{local}/{x["prefixlen"]}').network==lan for i in interfaces for x in i.get('addr_info',[])):
+    sys.exit('LAN_NET does not match the server interface prefix for this SSH connection')
+PYLAN
+}
+
+rules() {
+  cat <<EOF
+table inet hermes_ssh
+flush table inet hermes_ssh
+table inet hermes_ssh {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        tcp dport 22 ct state established accept
+        iifname "$iface" ip saddr $network tcp dport 22 accept
+        tcp dport 22 drop
+    }
+}
+EOF
+}
+
+check_table() {
+  local actual expected
+  actual=$(nft -nn -y list table inet hermes_ssh) || return 1
+  expected=$(rules | tail -n +3)
+  [[ $(awk '{$1=$1} NF { print }' <<< "$actual") == "$(awk '{$1=$1} NF { print }' <<< "$expected")" ]]
+}
+
+if [[ "$action" == rollback ]]; then
+  if [[ ! -e "$state" && ! -e "$unit" && ! -e "$rule" ]] &&
+     ! systemctl is-active --quiet "$timer" && ! nft list table inet hermes_ssh >/dev/null 2>&1; then
+    echo 'OK: no managed SSH restriction to withdraw.'
+    exit 0
+  fi
+  read -r -p 'Remove the managed LAN-only firewall for TCP 22? Type YES: ' answer </dev/tty
+  [[ "$answer" == YES ]]
+  if [[ -e "$unit" ]]; then systemctl disable --now "$service"; fi
+  if nft list table inet hermes_ssh >/dev/null 2>&1; then nft delete table inet hermes_ssh; fi
+  rm -f -- "$unit" "$rule" "$state/token" "$state/rules.nft" "$state/connection" "$state/start"
+  if [[ -d "$state" ]]; then rmdir -- "$state"; fi
+  if systemctl is-active --quiet "$timer"; then systemctl stop "$timer"; fi
+  systemctl daemon-reload
+  echo 'OK: managed table and persistent unit removed.'
+  exit 0
+fi
+
+check_lan
+if [[ -f "$rule" && -f "$unit" ]] && systemctl is-active --quiet "$service"; then
+  [[ ! -L "$rule" && ! -L "$unit" && $(stat -c '%u:%g:%a' "$rule") == 0:0:644 ]] || fail 'Unsafe existing persistent SSH firewall file'
+  cmp -s "$rule" <(rules) && check_table && systemctl is-enabled --quiet "$service" ||
+    fail 'Existing committed SSH firewall does not match. Inspect before changing it.'
+  echo 'OK: LAN-only SSH firewall already active and enabled.'
+  exit 0
+fi
+
+case "$action" in
+  stage)
+    if systemctl is-active --quiet "$timer"; then
+      check_table || fail 'Rollback timer exists with unexpected runtime rules; wait for rollback or inspect.'
+      echo 'OK: staging already active; original deadline stays in effect.'
+      exit 0
+    fi
+    [[ ! -e "$state" && ! -e "$rule" && ! -L "$rule" && ! -e "$unit" && ! -L "$unit" ]] ||
+      fail 'Existing state needs inspection or explicit firewall-rollback before re-staging.'
+    if nft list table inet hermes_ssh >/dev/null 2>&1; then fail 'Unmanaged hermes_ssh table already exists.'; fi
+    nft list ruleset
+    read -r -p 'Stage restriction on new TCP-22 SSH connections for five minutes? Type YES: ' answer </dev/tty
+    [[ "$answer" == YES ]]
+    mkdir -m 700 "$state"
+    armed=0
+    trap 'if (( ! armed )); then rm -f -- "$state/token" "$state/rules.nft" "$state/connection" "$state/start"; rmdir "$state"; fi' EXIT
+    token=$(cat /proc/sys/kernel/random/uuid)
+    printf '%s\n' "$token" >"$state/token"
+    printf '%s\n' "$conn" >"$state/connection"
+    rules >"$state/rules.nft"
+    nft -c -f "$state/rules.nft"
+    python3 -c 'import time; print(time.monotonic_ns()//1000)' >"$state/start"
+    systemd-run --unit=hermes-ssh-rollback --on-active=5m --timer-property=AccuracySec=1s /usr/bin/flock /run/hermes-ssh-firewall.lock /bin/bash -eu -c '
+      s=/run/hermes-ssh-stage
+      r=/etc/nftables.d/hermes-ssh.nft
+      u=/etc/systemd/system/hermes-ssh-firewall.service
+      [[ -f "$s/token" && $(cat "$s/token") == "$1" && ! -e "$r" ]] || exit 0
+      if nft list table inet hermes_ssh >/dev/null 2>&1; then nft delete table inet hermes_ssh; fi
+      if [[ -f "$u" ]]; then systemctl disable --now hermes-ssh-firewall.service; rm -f -- "$u"; systemctl daemon-reload; fi
+      rm -f -- "$s/token" "$s/rules.nft" "$s/connection" "$s/start"
+      rmdir "$s"
+    ' _ "$token"
+    armed=1
+    nft -f "$state/rules.nft"
+    check_table || fail 'Staged table differs; rollback timer remains armed.'
+    echo 'Open a NEW direct LAN SSH login now. Commit from that login within five minutes.'
+    ;;
+  commit)
+    [[ -d "$state" && -n "$session" && ! -e "$rule" ]] || fail 'No committable staging state or PAM SSH login session.'
+    systemctl is-active --quiet "$timer" || fail 'Staging expired; inspect firewall and stage again.'
+    [[ "$conn" != "$(cat "$state/connection")" ]] || fail 'Commit must run in a different SSH connection.'
+    [[ $(loginctl show-session "$session" -p Remote --value) == yes &&
+       $(loginctl show-session "$session" -p Service --value) == sshd ]] || fail 'Run outside tmux/su in a new SSH login with a logind session.'
+    logged_in=$(loginctl show-session "$session" -p TimestampMonotonic --value)
+    start=$(cat "$state/start")
+    [[ "$logged_in" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ ]] && (( logged_in > start )) ||
+      fail 'The current SSH login predates staging.'
+    check_table || fail 'Staged rules differ.'
+    cmp -s "$state/rules.nft" <(rules) || fail 'Staged LAN settings changed.'
+    mkdir -p -m 755 /etc/nftables.d
+    tmp=$(mktemp /etc/nftables.d/.hermes-ssh.XXXXXX)
+    trap 'rm -f -- "$tmp"' EXIT
+    install -m 644 "$state/rules.nft" "$tmp"
+    install -m 644 /dev/stdin "$unit" <<'UNIT'
+[Unit]
+Description=Restrict OpenSSH to home LAN
+After=nftables.service
+Before=tailscaled.service
+ConditionPathExists=/etc/nftables.d/hermes-ssh.nft
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/hermes-ssh.nft
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable "$service"
+    now=$(python3 -c 'import time; print(time.monotonic_ns()//1000)')
+    (( now - start < 300000000 )) || fail 'Staging expired before commit; automatic rollback follows.'
+    mv -T -- "$tmp" "$rule"
+    if ! systemctl start "$service" || ! systemctl is-active --quiet "$service" || ! check_table; then
+      rm -f -- "$rule"
+      fail 'Persistence failed; the automatic rollback remains armed.'
+    fi
+    rm -f -- "$state/token" "$state/rules.nft" "$state/connection" "$state/start"
+    rmdir -- "$state"
+    systemctl stop "$timer"
+    echo 'OK: tested SSH firewall active and persistent.'
+    ;;
+  *) fail 'Unknown firewall action' ;;
+esac
+ROOT
+'''
+
+[tasks._messaging]
+description = "Internal messaging configuration"
+hide = true
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: _messaging, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+platform=${HERMES_MESSAGING_PLATFORM:?Missing platform}
+[[ "$platform" == telegram || "$platform" == discord ]]
+[[ -t 0 && -t 1 ]] || { echo 'Run in an interactive SSH terminal.' >&2; exit 1; }
+cd /
+sudo -v
+read -r -s -p "Bot token for $platform (empty keeps current): " token
+printf '\n'
+read -r -p 'Permitted numeric user ID (not a chat or guild ID): ' user_id
+printf '%s\n%s\n' "$token" "$user_id" | sudo -n -H -u "$HERMES_USER" -- /usr/bin/python3 -c "$(cat <<'PYMESSAGING'
+import os, pathlib, re, stat, sys, tempfile
+os.umask(0o077)
+platform=sys.argv[1].upper()
+directory=pathlib.Path.home()/'.hermes'
+p=directory/'.env'
+if directory.is_symlink() or p.is_symlink() or (p.exists() and not p.is_file()):
+    sys.exit('Expected a regular Hermes .env')
+old=p.read_text() if p.exists() else ''
+token, uid=(sys.stdin.readline().strip() for _ in range(2))
+key=platform+'_BOT_TOKEN'
+def lookup(k):
+    matches=re.findall(r'^\s*(?:export[ \t]+)?'+re.escape(k)+r'[ \t]*=[ \t]*(.*)$',old,re.M)
+    if len(matches)>1:
+        sys.exit('Duplicate setting: '+k)
+    return matches[0].strip().strip('"\'') if matches else ''
+token=token or lookup(key)
+pattern=r'\d+:[A-Za-z0-9_-]+' if platform=='TELEGRAM' else r'[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2}'
+if not re.fullmatch(pattern,token) or not re.fullmatch(r'[1-9]\d{0,24}',uid):
+    sys.exit('Invalid token format or user ID')
+if lookup('GATEWAY_ALLOWED_USERS'):
+    sys.exit('Global GATEWAY_ALLOWED_USERS exists. Move its IDs to platform-specific lists before updating this platform.')
+if platform=='DISCORD':
+    import yaml
+    config=directory/'config.yaml'
+    if config.is_symlink():
+        sys.exit('Expected regular config.yaml')
+    cfg=yaml.safe_load(config.read_text()) if config.exists() else {}
+    discord=(cfg or {}).get('discord') or {}
+    if any(lookup('DISCORD_'+k.upper()) or discord.get(k) for k in ('allowed_roles','allowed_channels','no_thread_channels')):
+        sys.exit('Existing Discord role/channel rules need manual review before switching to a single-user setup.')
+values={key:token,platform+'_ALLOWED_USERS':uid,'GATEWAY_ALLOW_ALL_USERS':'false'}
+if platform=='TELEGRAM':
+    values.update(TELEGRAM_ALLOW_ALL_USERS='false', TELEGRAM_GROUP_ALLOWED_USERS='', TELEGRAM_GROUP_ALLOWED_CHATS='',
+                  TELEGRAM_GUEST_MODE='false', TELEGRAM_WEBHOOK_URL='',TELEGRAM_ALLOW_BOTS='none')
+else:
+    values.update(DISCORD_ALLOW_ALL_USERS='false', DISCORD_AUTO_THREAD='true', DISCORD_REQUIRE_MENTION='true',
+                  DISCORD_THREAD_REQUIRE_MENTION='false', DISCORD_FREE_RESPONSE_CHANNELS='', DISCORD_ALLOW_BOTS='none')
+lines=old.splitlines()
+for k,value in values.items():
+    matches=[i for i,line in enumerate(lines) if re.match(r'^\s*(?:export\s+)?'+re.escape(k)+r'\s*=',line)]
+    if len(matches)>1:
+        sys.exit('Duplicate setting: '+k)
+    if matches:
+        if lookup(k)!=value:
+            lines[matches[0]]=k+'='+value
+    else:
+        lines.append(k+'='+value)
+new='\n'.join(lines)+'\n'
+if new!=old:
+    directory.mkdir(mode=0o700, exist_ok=True)
+    tmp=None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w',dir=directory,delete=False) as f:
+            tmp=pathlib.Path(f.name)
+            f.write(new)
+        os.replace(tmp,p)
+    finally:
+        if tmp: tmp.unlink(missing_ok=True)
+if stat.S_IMODE(p.stat().st_mode)!=0o600:
+    p.chmod(0o600)
+print('OK: platform configuration saved. Apply with mise run gateway, then test permissions and replies.')
+PYMESSAGING
+)" "$platform"
+unset token user_id
+'''
+
+[tasks._dashboard]
+description = "Internal Dashboard configuration and verification"
+hide = true
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: _dashboard, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+if [[ "${HERMES_DASHBOARD_ACTION:-}" != status ]]; then
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+fi
+cd /
+uid=$(id -u "$HERMES_USER")
+sudo -v
+hermes_user() {
+  sudo -H -u "$HERMES_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" bash -c 'cd "$HOME" || exit; export PATH="$HOME/.local/bin:$PATH"; exec "$@"' _ "$@"
+}
+action=${HERMES_DASHBOARD_ACTION:?Missing Dashboard action}
+unit=hermes-dashboard.service
+if [[ "$action" == off ]]; then
+  state=$(hermes_user systemctl --user show "$unit" -p LoadState --value)
+  if [[ "$state" == not-found ]]; then echo 'OK: Dashboard unit absent.'; exit 0; fi
+  hermes_user systemctl --user disable --now "$unit"
+  state=$(hermes_user systemctl --user show "$unit" -p ActiveState --value)
+  [[ "$state" == inactive || "$state" == failed ]]
+  [[ -z $(ss -H -lnt 'sport = :9119') ]] || { echo 'Another process still listens on 9119.' >&2; exit 1; }
+  echo 'OK: Dashboard off.'
+  exit 0
+fi
+
+host=$(sudo tailscale status --json | python3 -c 'import json,re,sys; v=json.load(sys.stdin); n=v["Self"]["DNSName"].rstrip("."); assert v["BackendState"]=="Running" and re.fullmatch(r"[A-Za-z0-9-]+\.[A-Za-z0-9.-]+\.ts\.net",n), "Tailscale DNS not ready"; print("hermes-dashboard."+n.split(".",1)[1])')
+healthy() {
+  local listeners code
+  hermes_user systemctl --user is-active --quiet "$unit" || return 1
+  listeners=$(ss -H -lnt 'sport = :9119') || return 1
+  [[ $(awk '{print $4}' <<< "$listeners") == 127.0.0.1:9119 ]] || return 1
+  code=$(curl --noproxy '*' --silent --show-error --max-time 4 --output /dev/null --write-out '%{http_code}' -H "Host: $host" -H 'X-Forwarded-Proto: https' http://127.0.0.1:9119/login) || return 1
+  [[ "$code" == 200 ]] || return 1
+  code=$(curl --noproxy '*' --silent --show-error --max-time 4 --output /dev/null --write-out '%{http_code}' -H "Host: $host" -H 'X-Forwarded-Proto: https' http://127.0.0.1:9119/api/auth/me) || return 1
+  [[ "$code" == 401 || "$code" == 403 ]]
+}
+if hermes_user systemctl --user is-enabled --quiet "$unit" && healthy; then
+  echo "OK: Dashboard loopback listener and sign-in gate verified for https://$host."
+  exit 0
+fi
+[[ "$action" == install || "$action" == on ]] || { echo 'Dashboard disabled or not ready; inspect its journal and port 9119.' >&2; exit 1; }
+if [[ "$action" == install ]]; then
+  read -r -p 'Set up Dashboard on loopback with its Tailscale URL? Type YES: ' answer
+  [[ "$answer" == YES ]]
+fi
+hermes_user bash -s -- "$action" "$host" <<'DASHBOARD'
+set -Eeuo pipefail
+umask 077
+action=$1 host=$2
+unit="$HOME/.config/systemd/user/hermes-dashboard.service"
+svc=hermes-dashboard.service
+cfg="$HOME/.hermes/config.yaml"
+envfile="$HOME/.hermes/.env"
+bin=$(command -v hermes)
+[[ -f "$cfg" && ! -L "$cfg" && ! -L "$envfile" && ! -L "$unit" ]] ||
+  { echo 'Expected regular default-profile config and unit paths.' >&2; exit 1; }
+dropins=$(systemctl --user show "$svc" -p DropInPaths --value)
+[[ -z "$dropins" ]] || { echo 'Review the existing Dashboard unit drop-ins before managing it.' >&2; exit 1; }
+work=$(mktemp -d "$HOME/.hermes/.mise-dashboard.XXXXXX")
+was_active=0 was_enabled=0 changed_cfg=0 installed=0 started=0
+if systemctl --user is-active --quiet "$svc"; then was_active=1; fi
+if systemctl --user is-enabled --quiet "$svc"; then was_enabled=1; fi
+cleanup() {
+  local rc=$? restore_ok=1
+  trap - EXIT
+  if (( rc )); then
+    if (( started && ! was_active )); then systemctl --user stop "$svc" || restore_ok=0; fi
+    if (( started && ! was_enabled )); then systemctl --user disable "$svc" || restore_ok=0; fi
+    if (( changed_cfg )); then cp -p -- "$work/config" "$work/restore" && mv -T -- "$work/restore" "$cfg" || restore_ok=0; fi
+    if (( installed )); then rm -f -- "$unit" && systemctl --user daemon-reload || restore_ok=0; fi
+    if (( changed_cfg && was_active )); then systemctl --user restart "$svc" || restore_ok=0; fi
+    if (( ! restore_ok )); then echo "Dashboard rollback incomplete; recovery files: $work" >&2; exit "$rc"; fi
+  fi
+  rm -f -- "$work/config" "$work/restore" "$work/wanted" "$work/legacy"
+  rmdir -- "$work"
+  exit "$rc"
+}
+trap cleanup EXIT
+cat >"$work/wanted" <<UNIT
+[Unit]
+Description=Hermes Dashboard (local only)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=%h/.hermes
+EnvironmentFile=-%h/.hermes/.env
+ExecStart=$bin dashboard --host 127.0.0.1 --port 9119 --no-open
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=default.target
+UNIT
+sed -e '/^EnvironmentFile=/d' -e "s|^ExecStart=.* dashboard |ExecStart=$HOME/.hermes/hermes-agent/.hermes/bin/hermes dashboard |" "$work/wanted" > "$work/legacy"
+if [[ -e "$unit" ]]; then
+  cmp -s "$work/wanted" "$unit" || cmp -s "$work/legacy" "$unit" || { echo 'Dashboard unit differs; inspect without overwriting it.' >&2; exit 1; }
+else
+  [[ "$action" == install ]] || { echo 'Install the Dashboard unit first.' >&2; exit 1; }
+  [[ -z $(ss -H -lnt 'sport = :9119') ]] || { echo 'Port 9119 is occupied.' >&2; exit 1; }
+  install -d -m 700 "$(dirname "$unit")"
+  installed=1
+  install -m 644 "$work/wanted" "$unit"
+  systemctl --user daemon-reload
+fi
+if ! /usr/bin/python3 - "$cfg" "$host" <<'PYDASHBOARD'
+import pathlib, sys, yaml
+p=pathlib.Path(sys.argv[1]); cfg=yaml.safe_load(p.read_text()) or {}
+sys.exit((cfg.get('dashboard') or {}).get('public_url')!='https://'+sys.argv[2])
+PYDASHBOARD
+then
+  [[ "$action" == install ]] || { echo 'Dashboard URL needs setup; use dashboard-install.' >&2; exit 1; }
+  cp -p -- "$cfg" "$work/config"
+  changed_cfg=1
+  hermes config set dashboard.public_url "https://$host"
+fi
+started=1
+systemctl --user enable "$svc"
+if (( was_active && changed_cfg )); then systemctl --user restart "$svc"
+else systemctl --user start "$svc"; fi
+for attempt in {1..45}; do
+  listeners=$(ss -H -lnt 'sport = :9119')
+  if [[ $(awk '{print $4}' <<< "$listeners") == 127.0.0.1:9119 ]] && systemctl --user is-active --quiet "$svc"; then
+    args=(--noproxy '*' --silent --max-time 3 --output /dev/null --write-out '%{http_code}' -H "Host: $host" -H 'X-Forwarded-Proto: https')
+    login=$(curl "${args[@]}" http://127.0.0.1:9119/login || true)
+    gate=$(curl "${args[@]}" http://127.0.0.1:9119/api/auth/me || true)
+    if [[ "$login" == 200 && ( "$gate" == 401 || "$gate" == 403 ) ]]; then exit 0; fi
+  fi
+  sleep 2
+done
+echo 'Dashboard did not return the expected localhost listener and HTTP authentication gate.' >&2
+exit 1
+DASHBOARD
+healthy
+echo "OK: Dashboard ready for https://$host."
+'''
+
+[tasks._services]
+description = "Internal transactional Tailscale service management"
+hide = true
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: _services, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+if [[ "${HERMES_SERVICES_ACTION:-}" != status ]]; then
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+fi
+action=${HERMES_SERVICES_ACTION:?Missing Services action}
+sudo -v
+if [[ "$action" == configure || "$action" == off ]]; then
+  read -r -p "Tailscale Services action ($action), only hermes-dashboard and hermes-web. Type YES: " answer
+  [[ "$answer" == YES ]]
+fi
+sudo -n /usr/bin/python3 - "$action" "$WEB_PORT" "$TAILSCALE_TAG" <<'PYSERVICES'
+import http.client
+import json
+import re
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+ACTION, WEB_PORT, TAG = sys.argv[1:]
+SERVICES = {'svc:hermes-dashboard': 9119, 'svc:hermes-web': int(WEB_PORT)}
+
+
+def run(*argv):
+    return subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, timeout=45).stdout
+
+
+def get_configs():
+    data = json.loads(run('tailscale','serve','get-config','--all'))
+    configs = data.get('services', {})
+    if data.get('version') != '0.0.1' or not isinstance(configs, dict):
+        raise ValueError('Unexpected Tailscale Services JSON. Inspect CLI version and serve get-config --all.')
+    status = json.loads(run('tailscale','serve','status','--json')) or {}
+    raw = status.get('Services') or {}
+    for name in SERVICES:
+        if (name in configs) != (name in raw):
+            raise ValueError('Tailscale service configuration changed during inspection: '+name)
+        if name in raw:
+            detail = raw[name]
+            web = detail.get('Web') or {}
+            if (detail.get('TCP') != {'443': {'HTTPS': True}} or detail.get('Tun')
+                    or len(web) != 1
+                    or next(iter(web.values())).get('Handlers') != {'/': {'Proxy': expected(name)['tcp:443']}}):
+                raise ValueError('Unexpected raw listener or extra handler for '+name)
+    return configs
+
+
+def expected(name):
+    return {'tcp:443': f'http://127.0.0.1:{SERVICES[name]}'}
+
+
+def inspect(configs):
+    for name in SERVICES.keys() & configs.keys():
+        config = configs[name]
+        if config.get('endpoints') != expected(name) or config.keys() - {'endpoints','advertised'}:
+            raise ValueError('Unexpected mapping or metadata for '+name)
+
+
+def probe(port, host, path):
+    c = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    try:
+        c.request('GET', path, headers={'Host': host, 'X-Forwarded-Proto':'https'})
+        response = c.getresponse()
+        return response.status, urlsplit(response.getheader('Location','')).path
+    finally:
+        c.close()
+
+
+def check_ready():
+    status = json.loads(run('tailscale','status','--json'))
+    device = status['Self']
+    dns = device.get('DNSName','').rstrip('.')
+    if status['BackendState'] != 'Running' or TAG not in (device.get('Tags') or []) or not re.fullmatch(r'[A-Za-z0-9-]+\.[A-Za-z0-9.-]+\.ts\.net', dns):
+        raise ValueError(f'Expected running tailnet node, tag {TAG} and MagicDNS hostname')
+    serve = json.loads(run('tailscale','serve','status','--json')) or {}
+    if any((serve.get('AllowFunnel') or {}).values()):
+        raise ValueError('This host has active public Funnel configuration. Review independently before publishing Hermes.')
+    suffix = dns.split('.',1)[1]
+    for name, port in SERVICES.items():
+        host = name.removeprefix('svc:')+'.'+suffix
+        listeners = [line.split()[3] for line in run('ss','-H','-lnt',f'sport = :{port}').splitlines()]
+        if listeners != [f'127.0.0.1:{port}']:
+            raise ValueError(f'{name}: expected a single IPv4 loopback listener on {port}')
+        landing, _ = probe(port, host, '/login')
+        code, location = probe(port, host, '/')
+        auth, redirect = probe(port, host, '/api/auth/me')
+        redirects = (301,302,303,307,308)
+        if landing != 200 or code not in redirects or location != '/login' or not (auth in (401,403) or (auth in redirects and redirect == '/login')):
+            raise ValueError(f'{name}: authentication gate failed (/login={landing}, /={code}, /api/auth/me={auth})')
+        print(f'OK: {name} loopback/auth gate, https://{host}', flush=True)
+
+
+def clear(name):
+    run('tailscale','serve','clear',name)
+    if name in get_configs():
+        raise ValueError('Tailscale still has a mapping for '+name)
+
+
+def main():
+    before = get_configs()
+    inspect(before)
+    if ACTION == 'off':
+        for name in SERVICES:
+            if name in before:
+                clear(name)
+        print('OK: managed routes absent. Other Services were left intact.')
+        return
+    if ACTION not in ('status','configure'):
+        raise ValueError('Unknown Services action')
+    check_ready()
+    missing = [name for name in SERVICES if name not in before]
+    if drained := [name for name in SERVICES if name in before and before[name].get('advertised', True) is not True]:
+        raise ValueError('Matching routes are drained. Verify before re-advertising: '+', '.join(drained))
+    if ACTION == 'status':
+        if missing:
+            raise ValueError('Missing private mappings: '+', '.join(missing))
+        print('OK: both expected private mappings exist. Client access and host approval require separate checks.')
+        return
+    attempted = []
+    try:
+        for name in missing:
+            current = get_configs()
+            inspect(current)
+            if name in current:
+                continue
+            attempted.append(name)
+            run('tailscale','serve',f'--service={name}','--https=443',expected(name)['tcp:443'])
+        after = get_configs()
+        inspect(after)
+        if any(name not in after for name in SERVICES):
+            raise ValueError('Both mappings were not recorded')
+    except (OSError, ValueError, subprocess.SubprocessError):
+        for name in reversed(attempted):
+            try:
+                current = get_configs().get(name)
+                if current is not None:
+                    inspect({name: current})
+                    clear(name)
+            except (OSError,ValueError,subprocess.SubprocessError) as rollback_error:
+                print(f'Rollback incomplete for {name}: {rollback_error}',file=sys.stderr)
+        raise
+    print('OK: private mappings configured. Approve any pending hosts and test from permitted clients.')
+
+
+try:
+    main()
+except (OSError,ValueError,KeyError,TypeError,subprocess.SubprocessError,http.client.HTTPException) as e:
+    sys.exit('FAIL: Tailscale Services: '+str(e))
+PYSERVICES
+'''
+
+[tasks.legacy-retire]
+description = "Stop the old Syncthing/ACL stack before transferring KB ownership"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: legacy-retire, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+read -r -p 'Disable legacy KB sync, ACL jobs and the old publish timer? Type YES: ' answer
+[[ "$answer" == YES ]]
+for unit in hermes-kb-backup.timer hermes-kb-sync.service hermes-kb-acl-kb-sync.timer hermes-kb-acl-hermes.timer hermes-kb-firewall.service; do
+  load=$(sudo systemctl show "$unit" -p LoadState --value)
+  [[ "$load" != not-found ]] || continue
+  if sudo systemctl is-enabled --quiet "$unit"; then sudo systemctl disable --now "$unit"
+  else sudo systemctl stop "$unit"; fi
+done
+for unit in hermes-kb-acl-kb-sync.service hermes-kb-acl-hermes.service hermes-kb-backup.service hermes-kb-export.service; do
+  state=$(sudo systemctl show "$unit" -p ActiveState --value)
+  [[ "$state" == inactive || "$state" == failed ]] || { echo "Wait for $unit ($state), then retry." >&2; exit 1; }
+done
+ports=$(sudo ss -H -lntup '( sport = :22000 or sport = :8384 or sport = :21027 )')
+[[ -z "$ports" ]] || { printf 'Stop the remaining sync process before migration:\n%s\n' "$ports" >&2; exit 1; }
+if sudo nft list table inet hermes_kb >/dev/null 2>&1; then sudo nft delete table inet hermes_kb; fi
+echo 'OK: legacy jobs retired. Existing KB files and publisher keys are retained.'
+'''
+
+[tasks.kb-pause]
+description = "Disable the automatic publish timer and check for any in-flight publication"
+interactive = true
+run = '''
+#!/usr/bin/env bash
+set -Eeuo pipefail
+trap 'rc=$?; printf "FAIL: kb-pause, script line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+[[ $(id -u) != 0 && $(id -un) == "$ADMIN_USER" ]] || { echo "Run as $ADMIN_USER, without sudo mise" >&2; exit 1; }
+umask 077
+exec 9>"$HOME/.hermes-mise.lock"
+flock -n 9 || { echo 'Another modifying mise task is running for this administrator.' >&2; exit 1; }
+sudo systemctl disable --now hermes-kb-backup.timer
+for service in hermes-kb-export.service hermes-kb-backup.service; do
+  state=$(sudo systemctl show "$service" -p ActiveState --value)
+  [[ "$state" == inactive || "$state" == failed ]] || { echo "Timer disabled; $service is still $state. Wait for it to finish." >&2; exit 1; }
+done
+echo 'Automatic KB publishing paused.'
+'''
+
